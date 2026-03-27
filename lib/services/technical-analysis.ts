@@ -1,5 +1,9 @@
 import { RSI, MACD, BollingerBands, ATR, ADX } from 'technicalindicators';
 import { getHistoricalData } from './market-data';
+import { db } from '../db';
+import { technicalIndicators, stocks } from '../db/schema';
+import { eq } from 'drizzle-orm';
+import { nanoid } from '../utils';
 
 export interface TechnicalIndicators {
   rsi: number;
@@ -11,11 +15,25 @@ export interface TechnicalIndicators {
   volume: { current: number; average: number; ratio: number };
 }
 
+export interface SMCAnalysis {
+  fairValueGaps: Array<{
+    level: number;
+    type: 'bullish' | 'bearish';
+    filled: boolean;
+  }>;
+  orderBlocks: Array<{
+    priceRange: { low: number; high: number };
+    type: 'bullish' | 'bearish';
+    strength: number;
+  }>;
+}
+
 export interface TechnicalSignal {
   signal: 'STRONG_BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG_SELL';
   confidence: number;
   reasons: string[];
   indicators: TechnicalIndicators;
+  smc?: SMCAnalysis;
 }
 
 export async function analyzeTechnicalIndicators(
@@ -36,11 +54,14 @@ export async function analyzeTechnicalIndicators(
     throw new Error('Insufficient historical data for technical analysis');
   }
 
-  const prices = history.quotes.map((q: any) => q.close);
-  const high = history.quotes.map((q: any) => q.high);
-  const low = history.quotes.map((q: any) => q.low);
-  const close = history.quotes.map((q: any) => q.close);
-  const volumes = history.quotes.map((q: any) => q.volume);
+  // Filter out any null quotes
+  const quotes = history.quotes.filter((q: any) => q.close && q.high && q.low && q.volume);
+  
+  const prices = quotes.map((q: any) => q.close);
+  const high = quotes.map((q: any) => q.high);
+  const low = quotes.map((q: any) => q.low);
+  const close = quotes.map((q: any) => q.close);
+  const volumes = quotes.map((q: any) => q.volume);
 
   // RSI
   const rsiValues = RSI.calculate({ values: prices, period: 14 });
@@ -114,9 +135,60 @@ export async function analyzeTechnicalIndicators(
     },
   };
 
+  // SMC: Fair Value Gaps (FVG)
+  const fvgs: SMCAnalysis['fairValueGaps'] = [];
+  for (let i = quotes.length - 5; i >= 2; i--) {
+    const prev = quotes[i - 2];
+    const curr = quotes[i - 1];
+    const next = quotes[i];
+    
+    // Bullish FVG: Low of candle 3 > High of candle 1
+    if (next.low > prev.high) {
+      fvgs.push({
+        level: (next.low + prev.high) / 2,
+        type: 'bullish',
+        filled: close[close.length - 1] < prev.high
+      });
+    }
+    // Bearish FVG: High of candle 3 < Low of candle 1
+    else if (next.high < prev.low) {
+      fvgs.push({
+        level: (next.high + prev.low) / 2,
+        type: 'bearish',
+        filled: close[close.length - 1] > prev.low
+      });
+    }
+  }
+
+  // SMC: Order Blocks (OB)
+  const orderBlocks: SMCAnalysis['orderBlocks'] = [];
+  for (let i = quotes.length - 10; i >= 1; i--) {
+    const prev = quotes[i - 1];
+    const curr = quotes[i];
+    
+    // Bullish Order Block (last bearish candle before strong bullish move)
+    if (prev.close < prev.open && curr.close > curr.open && (curr.close - curr.open) > (prev.open - prev.close) * 2) {
+      orderBlocks.push({
+        priceRange: { low: prev.low, high: prev.high },
+        type: 'bullish',
+        strength: (curr.close - curr.open) / (prev.open - prev.close)
+      });
+    }
+    // Bearish Order Block (last bullish candle before strong bearish move)
+    else if (prev.close > prev.open && curr.close < curr.open && (prev.close - prev.open) * 2 < (curr.open - curr.close)) {
+      orderBlocks.push({
+        priceRange: { low: prev.low, high: prev.high },
+        type: 'bearish',
+        strength: (curr.open - curr.close) / (prev.close - prev.open)
+      });
+    }
+  }
+
   // Logic for Signal
   let score = 0;
   const reasons: string[] = [];
+
+
 
   // RSI logic
   if (currentRsi < 30) {
@@ -148,8 +220,18 @@ export async function analyzeTechnicalIndicators(
   // ADX logic (Trend Strength)
   if (lastAdx.adx > 25) {
     reasons.push(`Strong trend (ADX: ${lastAdx.adx.toFixed(2)})`);
-  } else {
-    reasons.push(`Weak/No trend (ADX: ${lastAdx.adx.toFixed(2)})`);
+  }
+
+  // FVG logic
+  if (fvgs.length > 0) {
+    const latestFvg = fvgs[0];
+    if (latestFvg.type === 'bullish' && !latestFvg.filled) {
+      score += 1;
+      reasons.push('Unfilled Bullish FVG identified');
+    } else if (latestFvg.type === 'bearish' && !latestFvg.filled) {
+      score -= 1;
+      reasons.push('Unfilled Bearish FVG identified');
+    }
   }
 
   let overallSignal: TechnicalSignal['signal'] = 'NEUTRAL';
@@ -158,10 +240,39 @@ export async function analyzeTechnicalIndicators(
   else if (score <= -3) overallSignal = 'STRONG_SELL';
   else if (score <= -1) overallSignal = 'SELL';
 
-  return {
+  const result: TechnicalSignal = {
     signal: overallSignal,
     confidence: Math.min(Math.abs(score) * 20, 100),
     reasons,
     indicators,
+    smc: { fairValueGaps: fvgs, orderBlocks: [] }
   };
+
+  // Persistence
+  try {
+    const stock = await db.query.stocks.findFirst({
+      where: eq(stocks.symbol, symbol),
+    });
+    
+    if (stock) {
+      await db.insert(technicalIndicators).values({
+        id: nanoid(),
+        stockId: stock.id,
+        rsi: indicators.rsi,
+        macd: indicators.macd,
+        movingAverages: indicators.movingAverages,
+        bollingerBands: indicators.bollingerBands,
+        atr: indicators.atr,
+        adx: indicators.adx,
+        signal: overallSignal,
+        confidence: result.confidence,
+        timestamp: new Date(),
+      });
+    }
+  } catch (dbError) {
+    console.warn(`[TechnicalAnalysis] Failed to store indicators:`, dbError);
+  }
+
+  return result;
 }
+

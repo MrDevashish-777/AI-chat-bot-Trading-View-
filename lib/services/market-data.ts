@@ -4,6 +4,24 @@ import { stockPrices, stocks } from '../db/schema';
 import { eq, desc } from 'drizzle-orm';
 import { nanoid } from '@/lib/utils';
 import { resolveSymbol, getCleanSymbol } from './symbol-resolver';
+// @ts-ignore
+import * as finnhub from 'finnhub';
+
+// Support for secondary data source
+let finnhubClient: any = null;
+
+if (process.env.FINNHUB_API_KEY) {
+  try {
+    const apiClient = (finnhub as any).ApiClient?.instance || (finnhub as any).default?.ApiClient?.instance;
+    if (apiClient) {
+      apiClient.authentications['api_key'].apiKey = process.env.FINNHUB_API_KEY;
+      finnhubClient = new (finnhub as any).DefaultApi();
+    }
+  } catch (e) {
+    console.warn('[MarketData] Failed to initialize Finnhub client:', e);
+  }
+}
+
 
 /**
  * Enhanced market data fetching with symbol resolution
@@ -44,7 +62,10 @@ export async function getMarketData(
           orderBy: [desc(stockPrices.timestamp)],
         });
 
-        const oneMinuteAgo = new Date(Date.now() - 60 * 1000);
+        // 1 minute cache for prices
+        const cacheTTL = 60 * 1000;
+        const oneMinuteAgo = new Date(Date.now() - cacheTTL);
+        
         if (lastPrice && lastPrice.timestamp > oneMinuteAgo) {
           console.log(`[MarketData] Using cached data for ${fullTicker}`);
           return {
@@ -66,16 +87,49 @@ export async function getMarketData(
 
     console.log(`[MarketData] Fetching fresh data for ${fullTicker}`);
 
-    // 3. Fetch data from Yahoo Finance using full ticker
-    const result: any = await yahooFinance.quote(fullTicker);
-    
+    let result: any = null;
+    let source = 'yahoo-finance';
+
+    // 3. Try Primary Source: Yahoo Finance
+    try {
+      result = await yahooFinance.quote(fullTicker);
+    } catch (e) {
+      console.warn(`[MarketData] Yahoo Finance failed for ${fullTicker}, trying fallbacks...`);
+    }
+
+    // 4. Try Secondary Source: Finnhub (if Yahoo fails)
+    if (!result && finnhubClient) {
+      try {
+        const quote: any = await new Promise((resolve, reject) => {
+          finnhubClient.quote(symbolMapping.symbol, (error: any, data: any) => {
+            if (error) reject(error);
+            else resolve(data);
+          });
+        });
+        
+        if (quote && quote.c) { // Current price
+          result = {
+            regularMarketPrice: quote.c,
+            regularMarketChange: quote.d,
+            regularMarketChangePercent: quote.dp,
+            regularMarketVolume: quote.v,
+            currency: symbolMapping.currency,
+            shortName: symbolMapping.company,
+          };
+          source = 'finnhub';
+        }
+      } catch (e) {
+        console.warn(`[MarketData] Finnhub fallback failed for ${fullTicker}`);
+      }
+    }
+
     if (!result) {
       throw new Error(
         `No data found for symbol: ${fullTicker}. Please check the ticker and exchange.`
       );
     }
 
-    // 4. Update stock metadata in DB
+    // 5. Update stock metadata in DB
     const [stock] = await db.insert(stocks).values({
       id: nanoid(),
       symbol: fullTicker,
@@ -91,7 +145,7 @@ export async function getMarketData(
       }
     }).returning();
 
-    // 5. Store price in historical table
+    // 6. Store price in historical table
     await db.insert(stockPrices).values({
       id: nanoid(),
       stockId: stock.id,
@@ -110,7 +164,7 @@ export async function getMarketData(
       change: result.regularMarketChange,
       changePercent: result.regularMarketChangePercent,
       name: symbolMapping.company !== 'Unknown' ? symbolMapping.company : result.shortName || result.longName,
-      currency: result.currency,
+      currency: result.currency || symbolMapping.currency,
       volume: result.regularMarketVolume,
       timestamp: new Date(),
     };
@@ -152,3 +206,4 @@ export function validateMarketData(data: any): boolean {
   if (!data.timestamp || isNaN(new Date(data.timestamp).getTime())) return false;
   return true;
 }
+
